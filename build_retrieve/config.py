@@ -95,6 +95,11 @@ class MemoryConfig:
     # --- VQA question (retrieval mode) ---
     question: str = ""
     options: List[str] = field(default_factory=list)
+    # M3-Bench open questions. until_sec drops memory whose end is later than this.
+    # transcript_path is an .srt file or a directory of {video_id}.srt files.
+    until_sec: Optional[float] = None
+    open_ended: bool = False
+    transcript_path: str = ""
 
     # --- Dataset parameters (eval mode) ---
     dataset: str = ""  # Dataset name: "videomme"
@@ -135,6 +140,10 @@ def get_args() -> argparse.Namespace:
     build_parser.add_argument("--l2_max_input_frames", type=int, default=None)
     build_parser.add_argument("--l3_fps", type=float, default=None)
     build_parser.add_argument("--l3_entity_dedup_threshold", type=float, default=None)
+    build_parser.add_argument(
+        "--transcript_path", type=str, default=None,
+        help="SRT file or directory. An existing transcript is reused; otherwise WorldMM transcribe.py writes it.",
+    )
 
     # --- retrieve subcommand ---
     retrieve_parser = subparsers.add_parser("retrieve", parents=[common], help="Answer questions using built memory")
@@ -142,7 +151,10 @@ def get_args() -> argparse.Namespace:
     retrieve_parser.add_argument("--memory_dir", type=str, required=True)
     retrieve_parser.add_argument("--video_id", type=str, required=True)
     retrieve_parser.add_argument("--question", type=str, required=True)
-    retrieve_parser.add_argument("--options", type=str, nargs="+", required=True)
+    retrieve_parser.add_argument("--options", type=str, nargs="+", default=None)
+    retrieve_parser.add_argument("--open_ended", action="store_true", help="M3-Bench free-text answer instead of A/B/C/D")
+    retrieve_parser.add_argument("--until_sec", type=float, default=None, help="Drop memory whose end_sec is after this time")
+    retrieve_parser.add_argument("--before_clip", type=int, default=None, help="M3-Bench clip index; cutoff is (before_clip + 1) * 30")
     retrieve_parser.add_argument("--num_options", type=int, default=None)
     retrieve_parser.add_argument("--entropy_threshold", type=float, default=None)
     retrieve_parser.add_argument("--initial_vqa_confidence", type=float, default=None)
@@ -166,6 +178,7 @@ def get_args() -> argparse.Namespace:
     full_parser.add_argument("--l2_max_input_frames", type=int, default=None)
     full_parser.add_argument("--l3_fps", type=float, default=None)
     full_parser.add_argument("--l3_entity_dedup_threshold", type=float, default=None)
+    full_parser.add_argument("--transcript_path", type=str, default=None)
     full_parser.add_argument("--num_options", type=int, default=None)
     full_parser.add_argument("--entropy_threshold", type=float, default=None)
     full_parser.add_argument("--initial_vqa_confidence", type=float, default=None)

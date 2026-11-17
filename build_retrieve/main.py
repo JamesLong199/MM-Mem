@@ -17,6 +17,7 @@ from tqdm import tqdm
 from config import get_args, build_config
 from models import ModelManager
 from memory_build import build_all_memory
+from m3bench import cutoff_seconds
 from memory_retrieve import hierarchical_retrieve_and_answer
 from dataset_utils import (
     load_dataset_by_name,
@@ -61,6 +62,7 @@ def main():
             output_dir=config.output_dir,
             config=config,
             model_manager=model_manager,
+            transcript_path=config.transcript_path or "",
         )
         print("\n=== Build Result ===")
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -70,8 +72,16 @@ def main():
         logger.info(f"Video: {config.video_path}")
         logger.info(f"Memory directory: {config.memory_dir}")
         logger.info(f"Video ID: {config.video_id}")
+        until_sec = config.until_sec
+        if getattr(args, "before_clip", None) is not None:
+            until_sec = cutoff_seconds(args.before_clip)
+        if config.open_ended and config.options:
+            logger.info("Open-ended mode ignores multiple-choice options")
+        if not config.open_ended and not config.options:
+            raise SystemExit("Multiple-choice retrieve requires --options. Pass --open_ended for M3-Bench.")
         logger.info(f"Question: {config.question}")
         logger.info(f"Options: {config.options}")
+        logger.info(f"Open-ended: {config.open_ended} until_sec: {until_sec}")
 
         result = hierarchical_retrieve_and_answer(
             video_path=config.video_path,
@@ -81,6 +91,8 @@ def main():
             video_id=config.video_id,
             config=config,
             model_manager=model_manager,
+            until_sec=until_sec,
+            open_ended=config.open_ended,
         )
         print("\n=== Retrieve and Answer Result ===")
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -96,6 +108,7 @@ def main():
             output_dir=config.output_dir,
             config=config,
             model_manager=model_manager,
+            transcript_path=config.transcript_path or "",
         )
         print("\n=== Build Result ===")
         print(json.dumps(build_result, ensure_ascii=False, indent=2))

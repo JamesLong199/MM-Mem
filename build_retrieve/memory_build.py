@@ -46,6 +46,7 @@ class L2Node:
     constituent_l1_indices: List[int] = field(default_factory=list)
     frame_paths: List[str] = field(default_factory=list)
     frame_timestamps: List[float] = field(default_factory=list)
+    transcript: str = ""
 
 
 @dataclass
@@ -113,6 +114,19 @@ Output your description as a JSON object:
 }
 ```"""
 
+
+def l2_caption_prompt(transcript_text: str) -> str:
+    """L2 caption prompt plus transcript lines that overlap the episode."""
+    block = (transcript_text or "").strip() or "- No transcript lines overlap this episode."
+    return (
+        L2_CAPTION_PROMPT
+        + "\n\nTranscript lines whose times overlap this episode:\n"
+        + block
+        + "\nInclude relevant speech from the transcript lines in the episode summary. "
+        + "Output only the JSON object."
+    )
+
+
 L3_ENTITY_PROMPT = """Please analyze the given video frames and extract key information in a structured JSON format in English. Identify and describe:
 
 Entities: List all distinct objects, people, animals, or other significant elements visible.
@@ -136,9 +150,57 @@ Each section should be detailed but concise. Avoid text outside the JSON."""
 # JSON parsing utilities
 # ============================================================
 
+def _salvage_json(response: str) -> Optional[Dict]:
+    """Recover a dict when the model hits max_new_tokens mid-JSON."""
+    start = response.find("{")
+    if start < 0:
+        return None
+    blob = response[start:]
+    fence = blob.find("```")
+    if fence > 0:
+        blob = blob[:fence]
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(blob)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    last = max(blob.rfind("}"), blob.rfind("]"))
+    if last < 0:
+        return None
+    chunk = blob[: last + 1]
+    stack = []
+    in_str = False
+    escape = False
+    for ch in chunk:
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]" and stack:
+            stack.pop()
+    if in_str:
+        return None
+    closers = {"{": "}", "[": "]"}
+    try:
+        obj = json.loads(chunk + "".join(closers[item] for item in reversed(stack)))
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 def parse_json_from_response(response: str) -> Optional[Dict]:
     """
     Parse JSON from model response, supporting ```json...``` format.
+    A truncated object is closed so a max-token cutoff still yields entities.
     """
     # Try to match ```json ... ```
     match = re.search(r"```json\s*(.*?)\s*```", response, re.DOTALL)
@@ -160,7 +222,7 @@ def parse_json_from_response(response: str) -> Optional[Dict]:
     try:
         return json.loads(response)
     except json.JSONDecodeError:
-        return None
+        return _salvage_json(response)
 
 
 def parse_decision(response: str) -> str:
@@ -280,6 +342,52 @@ def build_l1_memory(
 # L2 memory building
 # ============================================================
 
+
+# 360 images at 1024x576 is the largest caption that fit in this GPU (~100GB).
+# Longer episodes are sampled down to that count; fit_images_to_context still
+# scales resolution so the language-model context stays under 262144 tokens.
+MAX_CONTEXT_IMAGES = 360
+
+
+
+def _capped_fps(start_sec: float, end_sec: float, fps: float, limit: int = MAX_CONTEXT_IMAGES) -> float:
+    """Keep extracted frame count at or below the count that fits in GPU memory."""
+    duration = max(0.0, end_sec - start_sec)
+    count = duration * fps
+    if count <= limit:
+        return fps
+    capped = limit / max(duration, 1e-3)
+    logger.info(
+        "Capping frame extraction from %.2f fps to %.3f fps (about %d frames -> %d)",
+        fps,
+        capped,
+        int(count),
+        limit,
+    )
+    return capped
+
+
+def _limit_image_paths(paths, limit: int = MAX_CONTEXT_IMAGES):
+    if len(paths) <= limit:
+        return paths
+    import numpy as np
+    indices = np.linspace(0, len(paths) - 1, limit, dtype=int)
+    chosen = []
+    seen = set()
+    for index in indices.tolist():
+        index = int(index)
+        if index in seen:
+            continue
+        seen.add(index)
+        chosen.append(paths[index])
+    logger.info(
+        "Sampling %d frames down to %d for the context window",
+        len(paths),
+        len(chosen),
+    )
+    return chosen
+
+
 def _finalize_l2_node(
     current_l2: L2Node,
     video_path: str,
@@ -287,15 +395,27 @@ def _finalize_l2_node(
     config: MemoryConfig,
     llm,
     processor,
+    transcript_entries: Optional[list] = None,
 ) -> L2Node:
     """
     Finalize an L2 node:
     1. Extract 2fps frames from the original video as L2 visual memory
     2. Generate narrative caption with base model (vLLM)
+
+    When `transcript_entries` is provided, overlapping lines are stored on the
+    node and inserted into the caption prompt. None leaves the visual prompt unchanged.
     """
+    if transcript_entries is not None:
+        from transcript_audio import overlapping_transcript_text
+        current_l2.transcript = overlapping_transcript_text(
+            transcript_entries, current_l2.start_sec, current_l2.end_sec
+        )
     # Extract 2fps frames
     frames, timestamps = extract_frames_at_fps(
-        video_path, current_l2.start_sec, current_l2.end_sec, fps=config.l2_fps
+        video_path,
+        current_l2.start_sec,
+        current_l2.end_sec,
+        fps=_capped_fps(current_l2.start_sec, current_l2.end_sec, config.l2_fps),
     )
 
     if frames:
@@ -307,8 +427,13 @@ def _finalize_l2_node(
         current_l2.frame_timestamps = timestamps
 
         # Generate narrative caption with base model (pass file paths)
-        full_paths = [os.path.join(frame_dir, p) for p in frame_paths]
-        messages = build_messages(L2_CAPTION_PROMPT, images=full_paths)
+        full_paths = _limit_image_paths([os.path.join(frame_dir, p) for p in frame_paths])
+        caption_prompt = (
+            l2_caption_prompt(current_l2.transcript)
+            if transcript_entries is not None
+            else L2_CAPTION_PROMPT
+        )
+        messages = build_messages(caption_prompt, images=full_paths)
         response = generate_text(
             llm, processor, messages,
             max_new_tokens=config.l2_caption_max_new_tokens,
@@ -326,12 +451,23 @@ def build_l2_memory(
     video_id: str,
     config: MemoryConfig,
     model_manager: ModelManager,
+    transcript_path: str = "",
 ) -> List[L2Node]:
     """
     Build L2 layer narrative memory.
     Process L1 nodes sequentially, using the fine-tuned model to decide ADD_NEW/MERGE/DISCARD.
+
+    `transcript_path` points at an `.srt` file or a directory containing `{video_id}.srt`.
+    An existing non-empty transcript is reused. A missing one is produced by WorldMM's
+    faster-whisper script and then overlapped onto each episode caption.
     """
     logger.info("===== Starting L2 memory building =====")
+    transcript_entries = None
+    if transcript_path:
+        from transcript_audio import ensure_transcript, parse_srt
+        srt_path = ensure_transcript(video_path, transcript_path, video_id)
+        transcript_entries = parse_srt(srt_path)
+        logger.info("Loaded %d transcript lines from %s", len(transcript_entries), srt_path)
 
     if not l1_nodes:
         logger.warning("No L1 nodes available, skipping L2 building")
@@ -346,8 +482,42 @@ def build_l2_memory(
 
     # Cache of current L2 frame paths for L2 decision
     current_l2_frame_paths: List[str] = []
+    ckpt_path = os.path.join(output_dir, video_id, "l2_checkpoint.json")
+    start_i = 0
+    if os.path.exists(ckpt_path):
+        with open(ckpt_path) as f:
+            payload = json.load(f)
+        start_i = int(payload["next_i"])
+        l2_index = int(payload["l2_index"])
+        l2_nodes = [L2Node(**node) for node in payload["l2_nodes"]]
+        current_l2_frame_paths = payload.get("current_l2_frame_paths", [])
+        if payload.get("current"):
+            current_l2 = L2Node(**payload["current"])
+        logger.info(
+            "Resuming L2 at L1 position %d with %d completed episodes",
+            start_i,
+            len(l2_nodes),
+        )
+
+    def save_ckpt(next_i: int) -> None:
+        current = None
+        if current_l2 is not None:
+            current = asdict(current_l2)
+        payload = {
+            "next_i": next_i,
+            "l2_index": l2_index,
+            "l2_nodes": [asdict(node) for node in l2_nodes],
+            "current": current,
+            "current_l2_frame_paths": current_l2_frame_paths,
+        }
+        tmp_path = ckpt_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, ckpt_path)
 
     for i, l1_node in enumerate(l1_nodes):
+        if i < start_i:
+            continue
         # Current L1 frame file paths
         l1_frame_dir = os.path.join(output_dir, video_id, "L1_frames", f"l1_{l1_node.l1_index:04d}")
         l1_frame_full_paths = [os.path.join(l1_frame_dir, p) for p in l1_node.frame_paths]
@@ -399,7 +569,8 @@ def build_l2_memory(
         if decision == "ADD_NEW":
             # Finalize the current L2 node
             current_l2 = _finalize_l2_node(
-                current_l2, video_path, output_dir, config, base_llm, base_processor
+                current_l2, video_path, output_dir, config, base_llm, base_processor,
+                transcript_entries=transcript_entries,
             )
             l2_nodes.append(current_l2)
             logger.info(f"  L2[{current_l2.l2_index}]: Completed ({current_l2.start_sec:.1f}s - {current_l2.end_sec:.1f}s)")
@@ -425,10 +596,13 @@ def build_l2_memory(
             # Skip this L1 node
             logger.info(f"  L1[{l1_node.l1_index}]: DISCARD, skipping")
 
+        save_ckpt(i + 1)
+
     # Finalize the last L2 node
     if current_l2 is not None:
         current_l2 = _finalize_l2_node(
-            current_l2, video_path, output_dir, config, base_llm, base_processor
+            current_l2, video_path, output_dir, config, base_llm, base_processor,
+            transcript_entries=transcript_entries,
         )
         l2_nodes.append(current_l2)
         logger.info(f"  L2[{current_l2.l2_index}]: Completed ({current_l2.start_sec:.1f}s - {current_l2.end_sec:.1f}s)")
@@ -436,6 +610,8 @@ def build_l2_memory(
     # Save L2 memory
     l2_path = os.path.join(output_dir, video_id, "l2_memory.jsonl")
     save_jsonl([asdict(n) for n in l2_nodes], l2_path)
+    if os.path.exists(ckpt_path):
+        os.remove(ckpt_path)
     logger.info(f"L2 memory building complete: {len(l2_nodes)} nodes, saved to {l2_path}")
 
     return l2_nodes
@@ -470,14 +646,33 @@ def build_l3_memory(
     embedding_model = model_manager.get_embedding_model()
 
     l3_data_list = []
+    ckpt_path = os.path.join(output_dir, video_id, "l3_checkpoint.json")
+    if os.path.exists(ckpt_path):
+        with open(ckpt_path) as f:
+            payload = json.load(f)
+        l3_data_list = [L3NodeData(**node) for node in payload.get("nodes", [])]
+        logger.info("Resuming L3 with %d completed episodes", len(l3_data_list))
+
+    done_ids = {node.l2_index for node in l3_data_list}
+
+    def save_l3_ckpt() -> None:
+        tmp_path = ckpt_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump({"nodes": [asdict(node) for node in l3_data_list]}, f)
+        os.replace(tmp_path, ckpt_path)
 
     for l2_node in l2_nodes:
         idx = l2_node.l2_index
+        if idx in done_ids:
+            continue
         logger.info(f"  L2[{idx}]: Extracting entities ({l2_node.start_sec:.1f}s - {l2_node.end_sec:.1f}s)")
 
         # Extract 1fps frames
         frames, timestamps = extract_frames_at_fps(
-            video_path, l2_node.start_sec, l2_node.end_sec, fps=config.l3_fps
+            video_path,
+            l2_node.start_sec,
+            l2_node.end_sec,
+            fps=_capped_fps(l2_node.start_sec, l2_node.end_sec, config.l3_fps),
         )
 
         if not frames:
@@ -491,7 +686,7 @@ def build_l3_memory(
 
         # Extract entities/actions/scenes with base model (with retries)
         entity_data = None
-        full_paths = [os.path.join(frame_dir, p) for p in frame_paths]
+        full_paths = _limit_image_paths([os.path.join(frame_dir, p) for p in frame_paths])
         for attempt in range(config.l3_entity_max_retries):
             messages = build_messages(L3_ENTITY_PROMPT, images=full_paths)
             response = generate_text(
@@ -501,7 +696,12 @@ def build_l3_memory(
             entity_data = parse_json_from_response(response)
             if entity_data and "entities" in entity_data:
                 break
-            logger.warning(f"  L2[{idx}]: JSON parsing failed (attempt {attempt + 1}), retrying")
+            logger.warning(
+                "  L2[%s]: JSON parsing failed (attempt %d), response=%r",
+                idx,
+                attempt + 1,
+                response[:1200],
+            )
 
         if entity_data is None:
             entity_data = {"entities": [], "actions": [], "scenes": []}
@@ -515,6 +715,8 @@ def build_l3_memory(
             frame_timestamps=timestamps,
         )
         l3_data_list.append(l3_node)
+        done_ids.add(idx)
+        save_l3_ckpt()
         logger.info(
             f"  L2[{idx}]: Extracted {len(l3_node.entities)} entities, "
             f"{len(l3_node.actions)} actions, {len(l3_node.scenes)} scenes"
@@ -541,6 +743,8 @@ def build_l3_memory(
 
     l3_path = os.path.join(output_dir, video_id, "l3_memory.jsonl")
     save_jsonl([asdict(d) for d in l3_data_list], l3_path)
+    if os.path.exists(ckpt_path):
+        os.remove(ckpt_path)
 
     logger.info(f"L3 memory building complete: {len(l3_data_list)} nodes, saved to {l3_path}")
     return video_graph, entity_graph, l3_data_list
@@ -555,18 +759,27 @@ def build_all_memory(
     output_dir: str,
     config: MemoryConfig,
     model_manager: ModelManager,
+    transcript_path: str = "",
 ) -> Dict[str, Any]:
     """
-    Complete bottom-up memory building: L1 -> L2 -> L3
+    Complete bottom-up memory building: L1 -> L2 -> L3.
+
+    `transcript_path` is forwarded to L2 captioning. Empty keeps the original
+    visual-only episode prompt.
     """
     video_id = os.path.splitext(os.path.basename(video_path))[0]
     logger.info(f"Starting memory building for video: {video_id}")
+    if not transcript_path:
+        transcript_path = getattr(config, "transcript_path", "") or ""
 
     # L1
     l1_nodes = build_l1_memory(video_path, output_dir, video_id, config, model_manager)
 
     # L2
-    l2_nodes = build_l2_memory(video_path, l1_nodes, output_dir, video_id, config, model_manager)
+    l2_nodes = build_l2_memory(
+        video_path, l1_nodes, output_dir, video_id, config, model_manager,
+        transcript_path=transcript_path,
+    )
 
     # L3
     video_graph, entity_graph, l3_data = build_l3_memory(

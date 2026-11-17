@@ -8,7 +8,7 @@ Knowledge graph construction and query module
 import os
 import pickle
 import logging
-from typing import Dict, List, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 from collections import defaultdict
 
 import numpy as np
@@ -153,14 +153,24 @@ def retrieve_from_graph(
     top_k_embedding: int = 20,
     top_k_rerank: int = 5,
     similarity_threshold: float = 0.5,
+    allowed_indices: Optional[Iterable[int]] = None,
 ) -> List[int]:
     """
     L3 knowledge graph retrieval: coarse ranking (BGE embedding) + fine ranking (BGE reranker).
     Returns a list of the most relevant L2 indices.
+
+    `allowed_indices` limits the pool before ranking. Indices outside it are never
+    returned, including the empty-graph and no-match fallbacks. None keeps every node.
     """
+    allowed = None if allowed_indices is None else set(allowed_indices)
+
+    def permitted(idx: int) -> bool:
+        return allowed is None or idx in allowed
+
+    visible_nodes = [idx for idx in video_graph.nodes() if permitted(idx)]
     if not entity_graph or video_graph.number_of_nodes() == 0:
         logger.warning("Knowledge graph is empty, returning all nodes")
-        return list(video_graph.nodes())
+        return visible_nodes
 
     candidate_indices = set()
 
@@ -173,11 +183,13 @@ def retrieve_from_graph(
         if similarities.size > 0:
             for i, sim in enumerate(similarities[0]):
                 if sim > similarity_threshold:
-                    candidate_indices.update(entity_graph[entity_keys[i]])
+                    for idx in entity_graph[entity_keys[i]]:
+                        if permitted(idx):
+                            candidate_indices.add(idx)
 
     # --- Step 2: Supplement via video_graph node text ---
     for node_idx in video_graph.nodes():
-        if node_idx in candidate_indices:
+        if not permitted(node_idx) or node_idx in candidate_indices:
             continue
         node_data = video_graph.nodes[node_idx]
         node_texts = (
@@ -195,9 +207,9 @@ def retrieve_from_graph(
 
     candidate_indices = list(candidate_indices)
     if not candidate_indices:
-        # No candidates matched, return all nodes
+        # No candidates matched. Fall back to the permitted pool only.
         logger.warning("No candidate nodes matched, returning all nodes")
-        return list(video_graph.nodes())[:top_k_rerank]
+        return visible_nodes[:top_k_rerank]
 
     # Limit coarse ranking count
     if len(candidate_indices) > top_k_embedding:
