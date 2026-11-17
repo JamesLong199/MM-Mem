@@ -243,8 +243,8 @@ def initial_vqa(
     llm, processor = model_manager.get_base_model()
 
     # Uniformly sample frames from the video up to the cutoff when one is set.
-    import decord
-    vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
+    from video_utils import open_video_reader
+    vr = open_video_reader(video_path)
     video_fps = vr.get_avg_fps()
     duration = len(vr) / video_fps
     if until_sec is not None:

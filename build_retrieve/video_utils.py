@@ -35,8 +35,7 @@ def detect_scenes(
 
     if not scene_list:
         # No scene transitions detected, treat the entire video as one scene
-        import decord
-        vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
+        vr = open_video_reader(video_path)
         duration = len(vr) / vr.get_avg_fps()
         logger.info(f"No scene transitions detected, treating entire video as a single scene: 0.0 - {duration:.2f}s")
         return [(0.0, duration)]
@@ -112,6 +111,56 @@ def get_l1_segments(
     return l1_segments
 
 
+def open_video_reader(video_path: str):
+    """Open a Decord reader on one thread.
+
+    The default thread pool aborts on some VP9/AV1 files with
+    ``threaded_decoder.cc: Check failed: run_.load()``.
+    """
+    import decord
+    decord.bridge.set_bridge("native")
+    return decord.VideoReader(video_path, ctx=decord.cpu(0), num_threads=1)
+
+
+def _read_indices_decord(video_path: str, frame_indices: List[int]) -> np.ndarray:
+    last = None
+    for attempt in range(2):
+        try:
+            vr = open_video_reader(video_path)
+            return vr.get_batch(frame_indices).asnumpy()
+        except Exception as exc:
+            last = exc
+            logger.warning("decord batch read failed (%s), attempt %s", exc, attempt + 1)
+    frames = []
+    for idx in frame_indices:
+        vr = open_video_reader(video_path)
+        frames.append(vr[int(idx)].asnumpy())
+    if not frames:
+        raise RuntimeError(f"decord could not read {video_path}") from last
+    return np.stack(frames)
+
+
+def _read_indices_pyav(video_path: str, frame_indices: List[int], video_fps: float) -> np.ndarray:
+    """Seek each timestamp with PyAV when Decord cannot decode the file."""
+    import av
+    frames = []
+    for idx in frame_indices:
+        target = float(idx) / video_fps
+        with av.open(video_path) as container:
+            stream = container.streams.video[0]
+            seek = int(target / stream.time_base) if stream.time_base else 0
+            container.seek(seek, stream=stream, any_frame=False, backward=True)
+            chosen = None
+            for frame in container.decode(stream):
+                if frame.time is None or frame.time + 1e-3 >= target:
+                    chosen = frame.to_ndarray(format="rgb24")
+                    break
+            if chosen is None:
+                raise RuntimeError(f"PyAV found no frame at {target:.3f}s in {video_path}")
+            frames.append(chosen)
+    return np.stack(frames)
+
+
 def extract_frames_at_fps(
     video_path: str,
     start_sec: float,
@@ -122,10 +171,7 @@ def extract_frames_at_fps(
     Extract frames uniformly at specified FPS from the original video.
     Returns (frame_list, timestamp_list).
     """
-    import decord
-    decord.bridge.set_bridge("native")
-
-    vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
+    vr = open_video_reader(video_path)
     video_fps = vr.get_avg_fps()
     total_frames = len(vr)
 
@@ -153,8 +199,11 @@ def extract_frames_at_fps(
     if not frame_indices:
         return [], []
 
-    # Extract frames
-    frames_data = vr.get_batch(frame_indices).asnumpy()
+    try:
+        frames_data = _read_indices_decord(video_path, frame_indices)
+    except Exception as exc:
+        logger.warning("decord frame read failed (%s); using PyAV", exc)
+        frames_data = _read_indices_pyav(video_path, frame_indices, video_fps)
 
     frames = []
     timestamps = []
