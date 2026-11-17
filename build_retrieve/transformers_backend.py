@@ -4,6 +4,11 @@ from __future__ import annotations
 import torch
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
+# The cuDNN SDPA backend builds no plan on this B200 and then aborts.
+torch.backends.cuda.enable_cudnn_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
+
 
 class _Logprob:
     def __init__(self, token: str, logprob: float) -> None:
