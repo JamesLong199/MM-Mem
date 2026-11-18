@@ -101,6 +101,21 @@ class MemoryConfig:
     open_ended: bool = False
     transcript_path: str = ""
 
+    # Opt-in catalog retrieval; hierarchical mode remains the default.
+    retrieval_mode: str = "hierarchical"
+    catalog_token_budget: int = 2000
+    catalog_page_tokens: int = 2000
+    catalog_fanout: int = 8
+    catalog_summary_tokens: int = 96
+    catalog_summary_mode: str = "model"
+    catalog_rebuild: bool = False
+    catalog_max_rounds: int = 8
+    catalog_read_tokens: int = 1200
+    catalog_context_tokens: int = 16000
+    catalog_action_max_tokens: int = 512
+    catalog_max_frames_per_read: int = 8
+    catalog_max_visual_frames: int = 16
+
     # --- Dataset parameters (eval mode) ---
     dataset: str = ""  # Dataset name: "videomme"
     data_dir: str = ""  # Dataset path (containing VQA questions, etc.)
@@ -128,6 +143,21 @@ def get_args() -> argparse.Namespace:
     common.add_argument("--max_model_len", type=int, default=None)
     common.add_argument("--max_images_per_prompt", type=int, default=None)
     common.add_argument("--seed", type=int, default=None)
+
+    def catalog_args(parser):
+        parser.add_argument("--catalog_token_budget", type=int, default=None)
+        parser.add_argument("--catalog_page_tokens", type=int, default=None)
+        parser.add_argument("--catalog_fanout", type=int, default=None)
+        parser.add_argument("--catalog_summary_tokens", type=int, default=None)
+        parser.add_argument("--catalog_summary_mode", choices=["model", "extractive"], default=None)
+        parser.add_argument("--catalog_rebuild", action="store_true")
+
+    catalog_parser = subparsers.add_parser("catalog", parents=[common], help="Compile a bounded catalog from existing memory")
+    catalog_parser.add_argument("--memory_dir", required=True)
+    catalog_parser.add_argument("--video_id", required=True)
+    catalog_parser.add_argument("--until_sec", type=float, default=None)
+    catalog_parser.add_argument("--before_clip", type=int, default=None)
+    catalog_args(catalog_parser)
 
     # --- build subcommand ---
     build_parser = subparsers.add_parser("build", parents=[common], help="Build memory for a video")
@@ -164,6 +194,15 @@ def get_args() -> argparse.Namespace:
     retrieve_parser.add_argument("--l2_embedding_top_k", type=int, default=None)
     retrieve_parser.add_argument("--l2_visual_top_k", type=int, default=None)
     retrieve_parser.add_argument("--l1_top_k", type=int, default=None)
+    retrieve_parser.add_argument("--retrieval_mode", choices=["hierarchical", "catalog"], default=None)
+    retrieve_parser.add_argument("--output_file", type=str, default=None, help="Optionally save the complete single-query result JSON")
+    catalog_args(retrieve_parser)
+    retrieve_parser.add_argument("--catalog_max_rounds", type=int, default=None)
+    retrieve_parser.add_argument("--catalog_read_tokens", type=int, default=None)
+    retrieve_parser.add_argument("--catalog_context_tokens", type=int, default=None)
+    retrieve_parser.add_argument("--catalog_action_max_tokens", type=int, default=None)
+    retrieve_parser.add_argument("--catalog_max_frames_per_read", type=int, default=None)
+    retrieve_parser.add_argument("--catalog_max_visual_frames", type=int, default=None)
 
     # --- full subcommand ---
     full_parser = subparsers.add_parser("full", parents=[common], help="Build memory + retrieve answers")

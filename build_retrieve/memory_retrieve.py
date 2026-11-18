@@ -712,6 +712,12 @@ def hierarchical_retrieve_and_answer(
     Open M3-Bench sets `open_ended` and `until_sec`. Segments whose end is after
     `until_sec` are not retrieved at L1, L2, or L3. The answer is a sentence.
     """
+    if getattr(config, "retrieval_mode", "hierarchical") == "catalog":
+        if not open_ended:
+            raise ValueError("Catalog mode currently requires --open_ended")
+        from catalog_retrieve import catalog_retrieve_and_answer
+        return catalog_retrieve_and_answer(
+            question, memory_dir, video_id, config, model_manager, until_sec=until_sec)
     if open_ended:
         return _open_hierarchical_retrieve_and_answer(
             video_path=video_path,

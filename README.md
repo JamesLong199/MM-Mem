@@ -138,6 +138,16 @@ The retrieval pipeline follows a top-down strategy with entropy-based early stop
 
 ## 5. SIB-GRPO Training
 
+### Fork addition: bounded catalog for open-ended QA
+
+This fork also supports `main.py retrieve --open_ended --retrieval_mode catalog`.
+The complete token-bounded root catalog stays in the answer model's context;
+read-only actions navigate external pages/records and optionally request saved
+frames. The existing `hierarchical` retrieval mode remains the default.
+Use existing built memories; no training or memory rebuilding is required.
+See [the implementation and Cursor/DGX test handoff](docs/catalog_prototype.md)
+for commands, temporal filtering, budgets, metrics, and prototype limitations.
+
 Train the L2 Memory Manager Agent with **SIB-GRPO** (Semantic Information Bottleneck - Group Relative Policy Optimization):
 
 ```bash

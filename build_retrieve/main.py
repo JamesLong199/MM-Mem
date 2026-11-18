@@ -12,20 +12,8 @@ import os
 import sys
 import json
 import logging
-from tqdm import tqdm
-
 from config import get_args, build_config
-from models import ModelManager
-from memory_build import build_all_memory
 from m3bench import cutoff_seconds
-from memory_retrieve import hierarchical_retrieve_and_answer
-from dataset_utils import (
-    load_dataset_by_name,
-    get_video_path,
-    load_completed_results,
-    append_result,
-    compute_accuracy,
-)
 
 
 def setup_logging():
@@ -45,14 +33,33 @@ def main():
 
     args = get_args()
     if args.command is None:
-        print("Please specify a subcommand: build / retrieve / full")
+        print("Please specify a subcommand: build / catalog / retrieve / full / eval")
         print("Use --help to view help")
         sys.exit(1)
 
     config = build_config(args)
+    # Parse help before importing optional inference/video dependencies.
+    from models import ModelManager
+    if args.command in ("build", "full"):
+        from memory_build import build_all_memory
+    if args.command in ("retrieve", "full", "eval"):
+        from memory_retrieve import hierarchical_retrieve_and_answer
     model_manager = ModelManager(config)
 
-    if args.command == "build":
+    if args.command == "catalog":
+        from catalog import render_entries
+        from catalog_retrieve import get_catalog
+        until_sec = config.until_sec
+        if args.before_clip is not None:
+            until_sec = cutoff_seconds(args.before_clip)
+        catalog, path, stats = get_catalog(config, model_manager, config.video_id, until_sec)
+        text = render_entries("Memory catalog", catalog["root"])
+        print(text)
+        print(json.dumps({"catalog_path": path, "until_sec": until_sec,
+                          "record_count": len(catalog["records"]), "page_count": len(catalog["pages"]),
+                          **stats}, ensure_ascii=False, indent=2))
+
+    elif args.command == "build":
         logger.info(f"=== Build Memory Mode ===")
         logger.info(f"Video: {config.video_path}")
         logger.info(f"Output directory: {config.output_dir}")
@@ -68,6 +75,8 @@ def main():
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
     elif args.command == "retrieve":
+        if args.output_file and os.path.exists(args.output_file):
+            raise FileExistsError(f"Result already exists: {args.output_file}")
         logger.info(f"=== Retrieve and Answer Mode ===")
         logger.info(f"Video: {config.video_path}")
         logger.info(f"Memory directory: {config.memory_dir}")
@@ -96,6 +105,10 @@ def main():
         )
         print("\n=== Retrieve and Answer Result ===")
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.output_file:
+            # Exclusive creation protects existing experiment results.
+            with open(args.output_file, "x", encoding="utf-8") as handle:
+                json.dump(result, handle, ensure_ascii=False, indent=2)
 
     elif args.command == "full":
         logger.info(f"=== Full Mode (Build + Retrieve) ===")
@@ -128,6 +141,9 @@ def main():
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
     elif args.command == "eval":
+        from tqdm import tqdm
+        from dataset_utils import (load_dataset_by_name, get_video_path,
+                                   load_completed_results, append_result, compute_accuracy)
         logger.info(f"=== Batch Dataset Evaluation Mode ===")
         logger.info(f"Dataset: {config.dataset}")
         logger.info(f"Data directory: {config.data_dir}")
